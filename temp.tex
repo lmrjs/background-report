@@ -1,0 +1,141 @@
+
+\subsection{Parsers and Parser Combinators}
+This discussion mostly follows Hutton and Meijer's paper on monadic parsing \cite{monadic-parsing}, but in a Racket context for familiarity.
+% TODO: Trim this section down a LOT!! Most of this is irrelevant to actually implementing a parser!
+\subsubsection{What is a Parser?}
+A parser, at its very core, is simply a function that transforms a string of concrete syntax into an abstract syntax structure. In the case of our FWAE parser written in Racket, it transforms an s-expression into abstract syntax, rather than a string, since the \texttt{read} function parses strings into s-expressions for us. In general, however, a parser will have to consume characters one by one. We can then imagine that fully parsing a language might take several smaller parsers working together, and that a single parser might instead return not only the abstract syntax structure of what it has parsed but also the rest of the string that it has not yet parsed, ready to be handed off to another parser. Furthermore, since a language may be parsed in multiple different ways (ones specified by ambiguous context-free grammars, for instance), we may wish to return a \textit{list} of results that contain a value and the rest of the string. We could then define a parser as follows:
+\begin{minted}{racket}
+;; p :: String -> (listof Result)
+(define-type Parser
+  [parser (p procedure?)])
+
+(define-type Result
+  [result (value any/c) (rest string?)])
+  
+;; parse :: Parser -> String -> (listof Result)
+;; apply the function in parse to the string to be parsed
+(define (parse p str)
+  ((parser-p p) str))
+\end{minted}
+Here, a parser variant wraps around the function that executes the parsing, while the parse function applies the function within a parser to a concrete string. For instance, the following is a parser that will parse a single character from a string, or return an empty list to indicate a failure to parse anything:
+\begin{minted}{racket}
+;; Parse the first character of a string and save it
+(define read-char
+  (parser (lambda (cs)
+            (if (string=? "" cs)
+                empty
+                (list (result (string (first (string->list cs)))
+                              (list->string (rest (string->list cs)))))))))
+                              
+(test (parse read-char "abc") (list (result "a" "bc")))
+\end{minted}
+(Unfortunately, there is no built-in elegant way to split a Racket string into its first character and its remaining characters.) The following is the same parser, except it does not return the first character as part of its return value.
+\begin{minted}{racket}
+;; Parse the first character of a string but don't save it
+(define skip-char
+  (parser (lambda (cs)
+            (if (string=? "" cs)
+                empty
+                (list (result ""
+                              (list->string (rest (string->list cs)))))))))
+(test (parse skip-char "abc") (list (result "" "bc")))
+\end{minted}
+Practically speaking, these parsers are rather inane and don't do anything useful, but we can use them to reason about more complex parsers.
+
+\subsubsection{Motivations for a Monadic Parser}
+Suppose we read the first character of a string and we want to decide whether to skip the next character or not based on whether the character is an \texttt{"a"}. We might write a function that conditionally returns a parser:
+\begin{minted}{racket}
+;; skip-a :: String -> Parser
+;; skip the next character if given "a"
+(define (skip-a value)
+  (if (string=? "a" value)
+      skip-char
+      read-char))
+\end{minted}
+Then given some parser and an input string, we want to apply the parser on the string, funnel its resulting value into f, then apply the parser we get back from f to the remaining string.
+\begin{minted}{racket}
+;; funnel :: Parser -> (String -> Parser) -> String -> (listof Result)
+;; apply p to str, getting a value and rest of string; then, apply f to value to get p;
+;; finally, apply p' to rest of string
+(define (funnel p f str)
+  (append* (map (lambda (res)
+                  (parse (f (result-value res))
+                         (result-rest res)))
+                (parse p str))))
+                
+(test (funnel read-char skip-a "abc") (list (result "" "c")))
+(test (funnel read-char skip-a "bbc") (list (result "b" "c")))
+\end{minted}
+As you can see, in the tests above, the parsing is not yet done: there remains a \texttt{"c"} to be parsed. What if we want to funnel this to \texttt{skip-a} again? We can't directly apply funnel, since it returns a list of Results, not a parser. Then let us modify the function to return a parser; we can also omit the \texttt{str} argument, since the string on which \texttt{p} will be applied will come from the argument of the function of the parser we return. And finally, we will rename our function to \texttt{(>>=)}, which resembles a funnel if applied infixedly (not in Racket, of course): \texttt{p >>= f}.
+\begin{minted}{racket}
+;; (>>=) :: Parser -> (String -> Parser) -> Parser
+(define (>>= p f)
+  (parser (lambda (str)
+            (append* (map (lambda (res)
+                            (parse (f (result-value res))
+                                   (result-rest res)))
+                            (parse p str))))))
+
+(test (parse (>>= read-char skip-a) "abc") (list (result "" "c")))
+(test (parse (>>= read-char skip-a) "bbc") (list (result "b" "c")))
+(test (parse (>>= (>>= read-char skip-a) skip-a) "abc") (list (result "c" "")))
+\end{minted}
+This function is not specific to parsers. In Haskell, it is the \texttt{bind} function belonging to the Monad typeclass. Here, it helps us to apply parsers sequentially, passing in the resulting value of each parse to the next function and consuming the input using each subsequent parser. We might think of it as a line of functions eating up the values from each parser in front of them, while spitting out a line of parsers that each eat up a portion of the input.
+
+\subsubsection{Combining Parsers}
+Naturally, we may wish to funnel the remaining input of a first parser to a second parser, ignoring the actual value that the first returns.
+\begin{minted}{racket}
+;; (>>) :: Parser -> Parser -> Parser
+;; parse using p1; then, ignoring value, parse remaining input using p2
+(define (>> p1 p2)
+  (>>= p1 (lambda _ p2)))
+\end{minted}
+This is a parser combinator: it combines two parsers and meaningfully combines their effects into one super-parser. Another common thing we may wish to do with two generic parsers could be to \textit{choose} one of the parsers to run, depending on what the input looks like. For instance, if our input were \texttt{"1ab3"}, we may want to parse the first character as a number, but the second character as a string. This is why a parser's return value is a list: we can run both parsers on the input and concatenate their results; since a failure to parse results in an empty list, the first result we encounter will be a valid one (or not, if \textit{both} parsers fail). The choice combinator looks like this (in infix syntax, the function name vaguely resembles a left/right turn sign: \texttt{p1 <> p2}):
+\begin{minted}{racket}
+;; (<>) :: Parser -> Parser -> Parser
+(define (<> p1 p2)
+  (parser (lambda (str)
+            (append (parse p1 str) (parse p2 str)))))
+\end{minted}
+Then, a parser that only parses digits:
+\begin{minted}{racket}
+(define parse-num
+  (parser (lambda (str)
+            (if (string=? "" str)
+                empty
+                (let* ([c   (string (first (string->list str)))]
+                       [cs  (list->string (rest (string->list str)))]
+                       [num (string->number c)])
+                  (if num
+                      (list (result num cs))
+                      empty))))))
+                      
+(test (parse (<> parse-num read-char) "a") (list (result "a" "")))
+(test (parse (<> parse-num read-char) "10") (list (result 1 "0") (result "1" "0")))
+\end{minted}
+Notice that in the second test, \textit{two} results are given, since both \texttt{parse-num} and \texttt{read-char} will successfully parse \texttt{"1"}, but we only really need to take the first result. In Parsec, a parser will actually return an Either, which itself is a monad (when applied to a type on its Left) that can take care of combining error results and multiple valid results for us.
+
+\subsubsection{\texttt{do} Syntax}\label{do-syntax}
+So far, we still have not yet used the result values in any meaningful way; our double-funnelling test simply throws away the value from the previous parser. In reality, we are likely to apply a sequence of parsers, then pass the values from these parsers to a function that will do something important with the values.
+\begin{minted}{racket}
+(parse (>>= p1 (lambda (v1)
+       (>>= p2 (lambda (v2)
+       (>>= p3 (lambda (v3)
+       ...
+       (f v1 v2 v3 ...))))))) ;; f :: v1 -> v2 -> v3 -> ... -> Parser
+  str)
+\end{minted}
+It is at this time that we must move to Haskell, as Haskell has a much more succinct built-in syntax for sequential applications of Monads while binding their result values to variables:
+\begin{minted}{haskell}
+p = do v1 <- p1
+       v2 <- p2
+       v3 <- p3
+       ...
+       f v1 v2 v3 ...
+parse p str
+\end{minted}
+Alternatively, we could wrap the function in a parser that consumes no input but outputs the function, then apply the parser's function to the values produced by each parser; this is exactly the notion of an Applicative.
+\begin{minted}{haskell}
+parse (f <$> p1 <*> p2 <*> p3 <*> ...) str
+\end{minted}
+The downside is that readability and comprehension is sacrificed for conciseness. While at a high level the syntax suggests that some application of \texttt{f} is done on the parsers and their resulting values, the infix operators obscure the inner workings of how the parsers are actually run.
